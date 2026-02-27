@@ -9,26 +9,82 @@ import std.string;
 import language;
 import parser;
 
-struct Queue (T)
+import core.atomic : atomicLoad, atomicStore;
+import core.sync.mutex : Mutex;
+import core.sync.condition : Condition;
+import core.thread : ThreadGroup;
+import std.container.array : Array;
+import std.container.binaryheap : BinaryHeap;
+
+struct Msg
 {
-	T [] contents;
+    ulong microtick; // priority key
+    uint  seq;       // tie-break inside same microtick (preserve send(v1,v2,...) order)
+    long  value;
+}
 
-	@property bool empty ()
-	{
-		return contents.empty;
-	}
+alias MsgHeap = BinaryHeap!(
+    Array!Msg,
+    "a.microtick > b.microtick || (a.microtick == b.microtick && a.seq > b.seq)"
+); // this comparator makes it a min-heap by microtick (see BinaryHeap docs) :contentReference[oaicite:2]{index=2}
 
-	T pop ()
-	{
-		auto res = contents.front;
-		contents.popFront ();
-		contents.assumeSafeAppend ();
-		return res;
-	}
+final class Mailbox
+{
+private:
+    Mutex mtx;
+    Condition cv;
+    MsgHeap heap;
+    uint seqCounter;
 
-	void push () (const auto ref T value)
+public:
+    this()
+    {
+        mtx = new Mutex;
+        cv  = new Condition(mtx);
+        heap = MsgHeap(Array!Msg.init);
+        seqCounter = 0;
+    }
+
+    void push(ulong microtick, long value)
+    {
+        synchronized (mtx)
+        {
+            heap.insert(Msg(microtick, seqCounter, value));
+            seqCounter += 1;
+            cv.notify();
+        }
+    }
+
+    // Wait until non-empty and return the *current* smallest microtick without popping
+    ulong waitFrontMicrotick()
+    {
+        synchronized (mtx)
+        {
+            while (heap.empty)
+            {
+                cv.wait();
+            }
+            return heap.front.microtick;
+        }
+    }
+
+    Msg popFront()
+    {
+        synchronized (mtx)
+        {
+            // caller guarantees non-empty
+            auto msg = heap.front;
+            heap.removeFront();
+            return msg;
+        }
+    }
+
+	void notifyAll()
 	{
-		contents ~= value;
+		synchronized (mtx)
+		{
+			cv.notifyAll();
+		}
 	}
 }
 
@@ -76,6 +132,7 @@ class Runner
 
 	Context [] state;
 	int delay;
+	ulong microtick;
 
 	this (Args...) (RunnerControl control_, int id_,
 	    FunctionBlock p, Args args)
@@ -85,28 +142,46 @@ class Runner
 
 		state = [Context (p, -1)];
 		delay = 0;
+		microtick = cast(ulong)id;
 		int argNum = 0;
+
+		if (p.parameterList.length >= 1)
+		{
+			state.back.vars[p.parameterList[argNum]] = Var(cast(long)id, true);
+			argNum += 1;
+		}
+		if (p.parameterList.length >= 2)
+		{
+			state.back.vars[p.parameterList[argNum]] = Var(cast(long)control.num, true);
+			argNum += 1;
+		}
+
 		static foreach (cur; args)
 		{
 			if (argNum >= p.parameterList.length)
 			{
-				throw new Exception ("not enough parameters");
+				throw new Exception("too many parameters");
 			}
-			static if (is (typeof (cur) : long))
+
+			static if (is (typeof(cur) : long))
 			{
-				state.back.vars[p.parameterList[argNum]] =
-				    Var (cur, true);
+				state.back.vars[p.parameterList[argNum]] = Var(cur, true);
 			}
-			else static if (is (typeof (cur) : long []))
+			else static if (is (typeof(cur) : long[]))
 			{
-				state.back.arrays[p.parameterList[argNum]] =
-				    Array (cur, true);
+				state.back.arrays[p.parameterList[argNum]] = Array(cur, true);
 			}
 			else
 			{
-				static assert (false);
+				static assert(false);
 			}
+
 			argNum += 1;
+		}
+
+		if (argNum < p.parameterList.length)
+		{
+			throw new Exception("not enough parameters");
 		}
 	}
 
@@ -195,20 +270,17 @@ class Runner
 		if (call.name == "send")
 		{
 			if (values.length < 1)
-			{
-				throw new Exception
-				    ("send: no first argument");
-			}
+				throw new Exception("send: no first argument");
+
 			if (values[0] < 0 || control.num <= values[0])
-			{
-				throw new Exception ("send: first argument " ~
-				    values[0].text ~ " not in [0.." ~
-				    control.num.text ~ ")");
-			}
+				throw new Exception("send: first argument " ~ values[0].text ~
+					" not in [0.." ~ control.num.text ~ ")");
+
+			auto toId = values[0].to!(size_t);
+
 			foreach (value; values[1..$])
 			{
-				control.queues[id][values[0].to !(size_t)]
-				    .push (value);
+				control.queues[id][toId].push(microtick, value);
 			}
 			return 0;
 		}
@@ -225,8 +297,11 @@ class Runner
 
 		if (call.name == "print")
 		{
-			writefln !("%(%s %)") (values);
-			stdout.flush ();
+			synchronized (control.printMtx)
+			{
+				writefln !("%(%s %)") (values);
+				stdout.flush();
+			}
 			return 0;
 		}
 
@@ -341,42 +416,78 @@ class Runner
 		}
 	}
 
-	void runStatementReceive (AssignStatement cur, CallExpression call)
-	{
-		auto values = call.argumentList
-		    .map !(e => evalExpression (e)).array;
+void runStatementReceive (AssignStatement cur, CallExpression call)
+{
+    auto values = call.argumentList.map!(e => evalExpression(e)).array;
 
-		if (values.length < 1)
-		{
-			throw new Exception
-			    ("receive: no first argument");
-		}
-		if (values[0] < 0 || control.num <= values[0])
-		{
-			throw new Exception ("receive: " ~
-			    "first argument " ~
-			    values[0].text ~ " not in [0.." ~
-			    control.num.text ~ ")");
-		}
-		if (values.length > 1)
-		{
-			throw new Exception
-			    ("receive: more than one argument");
-		}
+    if (values.length < 1)
+        throw new Exception("receive: no first argument");
+    if (values[0] < 0 || control.num <= values[0])
+        throw new Exception("receive: first argument " ~ values[0].text ~
+            " not in [0.." ~ control.num.text ~ ")");
+    if (values.length > 1)
+        throw new Exception("receive: more than one argument");
 
-		auto otherId = values[0].to !(size_t);
-		if (control.queues[otherId][id].empty)
-		{
-			state.back.pos -= 1;
-			delay = 1;
-			return;
-		}
+    auto otherId = values[0].to!(size_t);
 
-		auto addr = getAddr (cur.dest, true);
+    // ---- Phase A: wait until safe ----
+    bool isSafe ()
+    {
+        foreach (j; 0 .. control.num)
+        {
+            if (j == id) continue;
+            auto t = atomicLoad(control.nextMicrotick[j]);
+            if (t <= microtick) return false;
+        }
+        return true;
+    };
 
-		auto value = control.queues[otherId][id].pop ();
-		doAssign (cur, addr, value);
-	}
+    synchronized (control.progressMtx)
+    {
+        while (!control.hasError && !isSafe())
+        {
+            control.progressCv.wait();
+        }
+        if (control.hasError)
+            throw new Exception(control.errorMsg);
+    }
+
+    // ---- Phase B: wait for data (priority by microtick) ----
+    // Wait mailbox to become non-empty and look at smallest timestamp
+    auto frontTick = control.queues[otherId][id].waitFrontMicrotick();
+
+    // If message is from the future relative to our microtick,
+    // jump forward to first microtick strictly greater than frontTick.
+    if (frontTick >= microtick)
+    {
+        while (microtick <= frontTick)
+            microtick += cast(ulong)control.num;
+
+        atomicStore(control.nextMicrotick[id], microtick);
+
+        synchronized (control.progressMtx)
+        {
+            control.progressCv.notifyAll();
+        }
+
+        // After time jump, we must re-check safety (Phase A) again
+        synchronized (control.progressMtx)
+        {
+            while (!control.hasError && !isSafe())
+            {
+                control.progressCv.wait();
+            }
+            if (control.hasError)
+                throw new Exception(control.errorMsg);
+        }
+    }
+
+    // Now it is safe to pop the earliest message
+    auto addr = getAddr(cur.dest, true);
+    auto msg  = control.queues[otherId][id].popFront();
+    doAssign(cur, addr, msg.value);
+	delay = cur.complexity;
+}
 
 	void runStatementArray (AssignStatement cur, CallExpression call)
 	{
@@ -633,10 +744,28 @@ class Runner
 
 class RunnerControl
 {
-	Runner [] runners;
-	Queue !(long) [] [] queues;
+    Runner[] runners;
+    Mailbox[][] queues;              // [from][to]
+    shared ulong[] nextMicrotick;     // per thread: next microtick it can execute/send on
+    Mutex progressMtx;
+    Condition progressCv;
 
-	@property int num () const
+    Mutex printMtx;                  // optional but strongly recommended for print()
+    shared bool hasError;
+    shared string errorMsg;
+	shared long[] ticksDone;
+	long lastTicks;
+
+	@property long ticks() const { return lastTicks; }
+
+	private void wakeAllMailboxes()
+	{
+		foreach (i; 0 .. num)
+			foreach (j; 0 .. num)
+				queues[i][j].notifyAll();
+	}
+
+    @property int num() const
 	{
 		return runners.length.to !(int);
 	}
@@ -646,27 +775,105 @@ class RunnerControl
 		runners = new Runner [num_];
 		foreach (i, ref r; runners)
 		{
-			r = new Runner (this, i.to !(int), p,
-			    i.to !(int), num_, args);
+			r = new Runner(this, i.to!(int), p, args);
 		}
-		queues = new Queue !(long) [] [] (num_, num_);
+
+		queues = new Mailbox[][](num_, num_);
+		foreach (i; 0 .. num_)
+		{
+			foreach (j; 0 .. num_)
+			{
+				queues[i][j] = new Mailbox();
+			}
+		}
+
+		nextMicrotick = new shared ulong[num_];
+		foreach (i; 0 .. num_)
+		{
+			atomicStore(nextMicrotick[i], cast(ulong)i);
+		}
+
+		progressMtx = new Mutex;
+		progressCv  = new Condition(progressMtx);
+		printMtx    = new Mutex;
+		hasError    = false;
+		errorMsg    = "";
+
+		ticksDone = new shared long[num_];
+		foreach (i; 0 .. num_)
+			atomicStore(ticksDone[i], 0L);
+
+		lastTicks = 0L;
 	}
 
-	bool step ()
+	bool runParallel (long maxSteps)
 	{
-		bool isRunning = false;
-		foreach (ref r; runners)
+		auto group = new ThreadGroup;
+
+		foreach (i; 0 .. num)
 		{
-			try
-			{
-				isRunning |= r.step ();
-			}
-			catch (Exception e)
-			{
-				throw new Exception (format
-				    ("id %s, %s", r.id, e.msg));
-			}
+			group.create((int idx) {
+				return () {
+					long calls = 0L;
+					scope (exit) atomicStore(ticksDone[idx], calls);
+
+					try
+					{
+						auto r = runners[idx];
+
+						for (long s = 0L; s < maxSteps; s++)
+						{
+							if (!r.step())
+							{
+								atomicStore(nextMicrotick[idx], ulong.max);
+								synchronized (progressMtx) { progressCv.notifyAll(); }
+								return;
+							}
+
+							calls += 1;
+
+							r.microtick += cast(ulong)num;
+							atomicStore(nextMicrotick[idx], r.microtick);
+
+							synchronized (progressMtx) { progressCv.notifyAll(); }
+
+							if (hasError) return;
+						}
+					}
+					catch (Throwable e)
+					{
+						synchronized (progressMtx)
+						{
+							hasError = true;
+							errorMsg = "id " ~ idx.to!string ~ ", " ~ e.toString();
+							progressCv.notifyAll();
+						}
+
+						atomicStore(nextMicrotick[idx], ulong.max);
+
+						wakeAllMailboxes();
+					}
+				};
+			}(i));
 		}
-		return isRunning;
+
+		group.joinAll();
+
+		lastTicks = 0L;
+		foreach (i; 0 .. num)
+		{
+			auto t = atomicLoad(ticksDone[i]);
+			if (t > lastTicks) lastTicks = t;
+		}
+
+		if (hasError)
+			throw new Exception(errorMsg);
+
+		foreach (i; 0 .. num)
+		{
+			if (atomicLoad(nextMicrotick[i]) != ulong.max)
+				return true;
+		}
+		return false;
 	}
 }
