@@ -17,7 +17,7 @@ int main (string [] args)
 	bool compileOnly = false;
 	bool doDisplay = false;
 	int num = 100;
-	int steps = 1_000_000;
+	long steps = 1_000_000L;
 	string fileName = "";
 
 	// read custom parameters from arguments
@@ -40,7 +40,7 @@ int main (string [] args)
 		else if (args[pos] == "-s")
 		{
 			pos += 1;
-			steps = args[pos].to !(int);
+			steps = args[pos].to!(long);
 		}
 		else
 		{
@@ -77,21 +77,21 @@ int main (string [] args)
 
 	// execute program
 	auto rc = new RunnerControl (num, p, n, a);
-	int step;
+	long step = 0;
 	bool working = true;
-	for (step = 0; step < steps && working; step++)
+
+	try
 	{
-		try
-		{
-			working &= rc.step ();
-		}
-		catch (Exception e)
-		{
-			stderr.writeln ("step ", step, ", ", e.msg);
-			return 1;
-		}
+		working = rc.runParallel(steps);
+		step = rc.ticks;
 	}
-	stderr.writeln ("steps: ", step);
+	catch (Exception e)
+	{
+		stderr.writeln("step ", rc.ticks, ", ", e.msg);
+		return 1;
+	}
+
+	stderr.writeln("steps: ", step);
 
 	// simulate time limit exceeded
 	if (working)
